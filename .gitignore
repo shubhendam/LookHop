@@ -28,3 +28,6 @@ dist/
 .idea/
 Thumbs.db
 desktop.ini
+
+# Generated at build time (packaging/make_icons.py)
+assets/lookhop.icns

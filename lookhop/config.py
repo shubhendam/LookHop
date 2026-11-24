@@ -27,6 +27,7 @@ RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", SOURCE_ROOT))
 
 
 def _user_data_dir() -> Path:
+    """Per-user folder for settings, calibration and logs (differs per OS)."""
     if sys.platform == "win32":
         return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / APP_NAME
     if sys.platform == "darwin":
@@ -78,6 +79,7 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Config:
+    """All user settings, saved as config.json; unknown keys are ignored, missing ones default."""
     # "instant": jump as soon as your gaze settles on the other screen.
     # "mouse_move": jump only when you start moving the mouse while looking there.
     mode: str = "instant"
@@ -85,9 +87,11 @@ class Config:
     # Each setting has its own calibration profile.
     glasses: bool = False
     hotkey: str = "ctrl+alt+g"
-    # Which display is the laptop: "left", "right", "primary", or a device
-    # name like "\\\\.\\DISPLAY1". The largest other display is the monitor.
-    laptop_display: str = "left"
+    # Which display is the laptop: "left", "right", "primary", "builtin" (the computer's own
+    # display, macOS), or a device name like "\\\\.\\DISPLAY1". The largest other display is
+    # the monitor. On macOS the default is the built-in display, since the physical layout
+    # (which side the monitor sits on) says nothing about which one is the laptop.
+    laptop_display: str = "builtin" if sys.platform == "darwin" else "left"
     # Where the cursor lands: the "last" place it was on that screen, or the
     # "center" of the screen.
     warp_to: str = "last"
@@ -100,6 +104,9 @@ class Config:
     typing_guard_ms: int = 600
 
     camera_index: int = 0
+    # Camera by name; set by the picker shown before calibration when there are several cameras
+    # ("" = not chosen yet: the built-in one is used). Wins over camera_index where cameras can be listed.
+    camera_name: str = ""
     camera_width: int = 640
     camera_height: int = 480
     fps: float = 15.0         # analysis rate while a face is visible
@@ -129,22 +136,36 @@ class Config:
 
     @property
     def profile_path(self) -> Path:
-        name = "calibration_glasses.json" if self.glasses else "calibration.json"
-        return DATA_DIR / name
+        """Calibration file for the current glasses setting and the camera in use."""
+        from lookhop.cameras import camera_key  # lazy: cameras imports this module
+        return self.profile_path_for(camera_key(self))
+
+    def profile_path_for(self, camera: str) -> Path:
+        """Calibration file for the glasses setting and the camera id `camera`.
+
+        Each camera has its own profile (it sees you differently). With no camera id
+        (cameras can't be listed on this OS) the original names are used.
+        """
+        parts = ["calibration"] + (["glasses"] if self.glasses else []) + ([camera] if camera else [])
+        return DATA_DIR / ("_".join(parts) + ".json")
 
     @property
     def effective_iris_weight(self) -> float:
+        """Iris weight in use: head pose gets more say when wearing glasses."""
         return self.iris_weight_glasses if self.glasses else self.iris_weight
 
     def save(self) -> None:
+        """Write the settings to config.json."""
         CONFIG_PATH.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
 
     def update_from(self, other: "Config") -> None:
+        """Copy every setting from `other` into this object."""
         for f in fields(self):
             setattr(self, f.name, getattr(other, f.name))
 
 
 def _coerce(value, default):
+    """Convert a value from JSON to the type of its default (bool/int/float/str)."""
     if isinstance(default, bool):
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
@@ -153,6 +174,7 @@ def _coerce(value, default):
 
 
 def _validate(cfg: Config) -> None:
+    """Replace out-of-range or unknown values with the defaults."""
     d = Config()
     if cfg.mode not in MODES:
         log.warning("Unknown mode %r, using %r", cfg.mode, d.mode)
@@ -167,6 +189,7 @@ def _validate(cfg: Config) -> None:
 
 
 def load_config() -> Config:
+    """Read config.json (creating the data folder), apply migrations and validation."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     migrate_legacy_files()
     cfg = Config()

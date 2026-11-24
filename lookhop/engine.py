@@ -26,11 +26,12 @@ import time
 
 import cv2
 
+from lookhop.cameras import active_camera_name, camera_key, requested_missing
 from lookhop.config import Config
 from lookhop.model import GazeModel
 from lookhop.platform import (focus_screen, get_cursor, last_input_tick, list_screens,
                               mouse_button_down, resolve_roles, screen_at, set_cursor)
-from lookhop.tracker import Camera, FaceFeatures
+from lookhop.tracker import Camera, FaceFeatures, camera_index
 
 log = logging.getLogger(__name__)
 
@@ -43,9 +44,15 @@ PREVIEW_WIDTH = 320
 
 
 class Engine:
+    """Gaze engine: a vision thread (camera -> face -> gaze) plus a mouse thread that jumps the cursor."""
     def __init__(self, cfg: Config):
+        """Create the engine and load the calibration model if there is one."""
         self.cfg = cfg
         self.on_change = lambda: None  # set by the tray
+        # Called (from the vision thread) when the camera in use changes: (name, calibrated, missing)
+        self.on_camera_change = lambda name, calibrated, missing: None
+        self.camera_label = ""      # name of the camera the loaded profile belongs to
+        self._model_camera_key = None
 
         self.model: GazeModel | None = None
         self.state = MONITOR
@@ -84,18 +91,23 @@ class Engine:
 
     # ---------- lifecycle ----------
     def start(self) -> None:
+        """Start the vision and mouse threads."""
         for target, name in ((self._vision_loop, "vision"), (self._mouse_loop, "mouse")):
             t = threading.Thread(target=target, name=name, daemon=True)
             t.start()
             self._threads.append(t)
 
     def stop(self) -> None:
+        """Stop both threads and wait briefly for them."""
         self._stop.set()
         for t in self._threads:
             t.join(timeout=3)
 
     def reload_model(self) -> None:
-        path = self.cfg.profile_path
+        """(Re)load the calibration profile for the current glasses setting and camera."""
+        key = camera_key(self.cfg)
+        path = self.cfg.profile_path_for(key)
+        self.camera_label = active_camera_name(self.cfg)
         model = None
         if path.exists():
             try:
@@ -105,15 +117,35 @@ class Engine:
                 log.exception("Could not load %s", path)
         with self._lock:
             self.model = model
+            self._model_camera_key = key
             self._reset_gaze()
         self._set_status(self._idle_status())
 
+    def check_camera_change(self) -> None:
+        """If the camera in use changed (plugged / unplugged / re-chosen), switch profile.
+
+        Loads that camera's calibration (or none), restarts the capture and tells the tray
+        so the user can be told - and asked to calibrate when the camera has no profile yet.
+        """
+        if self._hold.is_set() or camera_key(self.cfg) == self._model_camera_key:
+            return
+        log.info("Camera changed: now %r", active_camera_name(self.cfg))
+        self.reload_model()
+        self._restart_cam.set()
+        try:
+            self.on_camera_change(self.camera_label, self.model is not None,
+                                  requested_missing(self.cfg))
+        except Exception:
+            log.exception("on_camera_change failed")
+
     def apply_iris_weight(self) -> None:
+        """Push the configured iris weight into the loaded model."""
         with self._lock:
             if self.model is not None:
                 self.model.iris_weight = self.cfg.effective_iris_weight
 
     def restart_camera(self) -> None:
+        """Ask the vision thread to close and reopen the camera (e.g. after switching cameras)."""
         self._restart_cam.set()
 
     def release_camera(self, timeout: float = 5.0) -> bool:
@@ -122,9 +154,11 @@ class Engine:
         return self._camera_free.wait(timeout)
 
     def resume_camera(self) -> None:
+        """Let the vision thread use the camera again after release_camera()."""
         self._hold.clear()
 
     def set_paused(self, paused: bool) -> None:
+        """Pause or resume tracking (the camera is released while paused)."""
         with self._lock:
             self.paused = paused
             self._reset_gaze()
@@ -132,10 +166,12 @@ class Engine:
         self._set_status(self._idle_status())
 
     def toggle_pause(self) -> None:
+        """Flip the paused state."""
         self.set_paused(not self.paused)
 
     # ---------- helpers ----------
     def _idle_status(self) -> str:
+        """Status to show when nothing is running: paused, no_model, or starting."""
         if self.paused:
             return "paused"
         if self.model is None:
@@ -143,21 +179,25 @@ class Engine:
         return "running" if self.status == "running" else "starting"
 
     def _set_status(self, status: str) -> None:
+        """Change the status and tell the tray if it changed."""
         if status != self.status:
             self.status = status
             self._notify()
 
     def _notify(self) -> None:
+        """Call on_change() (the tray refresh), logging any error."""
         try:
             self.on_change()
         except Exception:
             log.exception("on_change failed")
 
     def _typing(self, now: float) -> bool:
+        """True while the typing guard says a key was pressed recently."""
         return (self.cfg.typing_guard
                 and (now - self._last_key_time) * 1000 < self.cfg.typing_guard_ms)
 
     def _reset_gaze(self) -> None:
+        """Forget the gaze state and go back to 'monitor'."""
         changed = self.state != MONITOR or self.face
         self.state = MONITOR
         self.face = False
@@ -171,6 +211,7 @@ class Engine:
 
     # ---------- vision ----------
     def _vision_loop(self) -> None:
+        """Camera thread: grab frames, track the face and update the gaze state."""
         try:
             tracker = FaceFeatures()
         except Exception:
@@ -182,7 +223,11 @@ class Engine:
         next_retry = 0.0
         read_failures = 0
         last_t0 = 0.0
+        next_cam_check = 0.0
         while not self._stop.is_set():
+            if time.monotonic() >= next_cam_check:  # watch for cameras coming and going
+                next_cam_check = time.monotonic() + 3.0
+                self.check_camera_change()
             if self._restart_cam.is_set():
                 self._restart_cam.clear()
                 if cam is not None:
@@ -209,7 +254,7 @@ class Engine:
                 if self._hold.is_set():  # calibration asked for the camera meanwhile
                     self._camera_free.set()
                     continue
-                cam = Camera(self.cfg.camera_index, self.cfg.camera_width,
+                cam = Camera(camera_index(self.cfg), self.cfg.camera_width,
                              self.cfg.camera_height, fps=30)
                 if not cam.open():
                     cam = None
@@ -262,6 +307,7 @@ class Engine:
         self._camera_free.set()
 
     def _update_gaze(self, feats, now: float) -> None:
+        """Turn one frame's features into a laptop/monitor decision with hold times."""
         cfg = self.cfg
         with self._lock:
             model = self.model
@@ -307,6 +353,7 @@ class Engine:
                 self._notify()
 
     def _transition(self, new_state: str, reason: str) -> None:
+        """Switch gaze state and arm a jump to the new screen."""
         self.state = new_state
         self._pending = None
         self._armed = new_state
@@ -317,6 +364,7 @@ class Engine:
 
     # ---------- mouse ----------
     def _mouse_loop(self) -> None:
+        """Mouse thread: watch the cursor/keyboard and fire armed jumps at the right moment."""
         last = get_cursor()
         last_move = 0.0
         last_tick = last_input_tick()
@@ -371,12 +419,14 @@ class Engine:
             last = pos
 
     def _target_screen(self, role: str, screens):
+        """Screen to jump to for `role`, or None with only one display."""
         laptop, monitor = resolve_roles(screens, self.cfg.laptop_display)
         if monitor is None:
             return None
         return laptop if role == LAPTOP else monitor
 
     def _disarm_if_on_target(self, screens, pos) -> None:
+        """Cancel a pending jump when the cursor is already on the target screen."""
         with self._lock:
             if self._armed is None:
                 return
@@ -385,6 +435,7 @@ class Engine:
                 self._armed = None
 
     def _jump(self, target, role: str) -> None:
+        """Move the cursor to `target` (centre or last position) and focus the app there."""
         dest = target.center
         if self.cfg.warp_to == "last":
             remembered = self._last_pos.get(target.name)
@@ -402,6 +453,7 @@ class Engine:
         log.info("Cursor -> %s %s%s", role, dest, " (+focus)" if focused else "")
 
     def _try_warp(self) -> bool:
+        """Jump now if one is armed and allowed (not mid-drag, not while typing)."""
         with self._lock:
             role = self._armed
             if role is None or self.paused:
@@ -450,6 +502,7 @@ class Engine:
 
     # ---------- preview for the control panel ----------
     def _make_preview(self, frame, pts) -> None:
+        """Draw the camera frame with landmarks for the control panel's live view."""
         h, w = frame.shape[:2]
         scale = PREVIEW_WIDTH / w
         small = cv2.resize(frame, (PREVIEW_WIDTH, int(h * scale)), interpolation=cv2.INTER_AREA)

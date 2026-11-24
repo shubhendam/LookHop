@@ -1,6 +1,6 @@
 # Contributing to LookHop
 
-Thanks for helping! The most valuable contributions right now are **macOS and Linux ports**.
+Thanks for helping! The most valuable contribution right now is a **Linux port**.
 Everything except a thin OS layer is already cross-platform.
 
 ## Dev setup
@@ -35,10 +35,11 @@ lookhop/
     ├── __init__.py   picks the backend for this OS + documents the contract
     ├── base.py       Screen dataclass, laptop/monitor role logic (shared)
     ├── windows/      ✅ complete (ctypes / Win32)
-    ├── macos/        🛠️ stub with an implementation guide
+    ├── macos/        ✅ complete (pyobjc: Quartz / ApplicationServices)
     └── linux/        🛠️ stub with an implementation guide
 packaging/
-├── make_icons.py     renders assets/lookhop.ico + logo.png
+├── make_icons.py     renders assets/lookhop.ico + logo.png (+ .icns for the mac build)
+├── macos/            PyInstaller spec + build.sh (.app bundle)
 └── windows/          PyInstaller spec + build.ps1
 ```
 
@@ -72,4 +73,4 @@ Please mention the OS version, desktop environment (for Linux) and camera you te
 
 1. Bump `__version__` in `lookhop/__init__.py`.
 2. `git tag v0.1.1 && git push --tags`
-3. GitHub Actions builds the Windows zip, runs the selftest, and publishes the release.
+3. GitHub Actions builds the Windows and macOS zips, runs the selftest, and publishes the release.
