@@ -1,62 +1,45 @@
-"""macOS backend - NOT IMPLEMENTED YET (help wanted!).
+"""macOS backend (complete). Quartz / AppKit / ApplicationServices via pyobjc.
 
-Everything else in LookHop (camera, face tracking, calibration, control panel,
-tray) is cross-platform already. To port it, implement the functions below and
-set SUPPORTED = True. Suggested APIs (via pyobjc: pyobjc-framework-Quartz,
-pyobjc-framework-Cocoa):
-
-  list_screens       NSScreen.screens() -> frames (flip Y: Cocoa origin is bottom-left)
-                     or Quartz.CGGetActiveDisplayList + CGDisplayBounds (top-left origin)
-  get_cursor         Quartz.CGEventGetLocation(Quartz.CGEventCreate(None))
-  set_cursor         Quartz.CGWarpMouseCursorPosition((x, y))
-                     + CGAssociateMouseAndMouseCursorPosition(True)
-  mouse_button_down  Quartz.CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, btn)
-  last_input_tick    Quartz.CGEventSourceSecondsSinceLastEventType(..., kCGAnyInputEventType)
-                     (return a value that changes on keyboard/click input)
-  focus_screen       CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly) is front-to-back;
-                     pick the first normal-layer window whose bounds sit on that screen, then
-                     NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
-                       .activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
-  GlobalHotkey       Carbon RegisterEventHotKey, or a Quartz event tap
-  autostart          a LaunchAgent plist in ~/Library/LaunchAgents
-  make_dpi_aware     nothing to do (Quartz uses points everywhere)
-
-Permissions the user must grant: Camera, Accessibility (cursor + focus),
-and possibly Input Monitoring (hotkey / typing detection).
+Permissions the user must grant: Camera, and Accessibility (raising other apps'
+windows and the global hotkey). See permissions.py.
 """
 from __future__ import annotations
 
-from lookhop.platform._unsupported import NoHotkey as GlobalHotkey
-from lookhop.platform._unsupported import NotPortedYet, open_file
-from lookhop.platform._unsupported import tk_message_box as message_box
+import fcntl
+from pathlib import Path
+
+from lookhop.config import APP_NAME, DATA_DIR
+from lookhop.platform._common import open_file
+from lookhop.platform.macos import permissions
+from lookhop.platform.macos.autostart import autostart_enabled, set_autostart
+from lookhop.platform.macos.display import (get_cursor, last_input_tick, list_screens,
+                                            make_dpi_aware, message_box, mouse_button_down,
+                                            set_cursor)
+from lookhop.platform.macos.focus import focus_screen
+from lookhop.platform.macos.hotkey import GlobalHotkey, parse_hotkey
 
 NAME = "macOS"
-SUPPORTED = False
+SUPPORTED = True
 
 
-def _todo(what):
-    def fn(*_a, **_k):
-        raise NotPortedYet(what, NAME)
-    return fn
+def acquire_single_instance(app_name: str):
+    """Returns a handle to keep for the process lifetime, or None if already running."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(Path(DATA_DIR) / f"{app_name.lower()}.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        return None
+    return lock
 
 
-make_dpi_aware = lambda: None  # noqa: E731
-list_screens = _todo("list_screens")
-get_cursor = _todo("get_cursor")
-set_cursor = _todo("set_cursor")
-mouse_button_down = _todo("mouse_button_down")
-last_input_tick = _todo("last_input_tick")
-focus_screen = _todo("focus_screen")
-autostart_enabled = lambda: False  # noqa: E731
-set_autostart = _todo("set_autostart")
-acquire_single_instance = lambda app_name: object()  # noqa: E731
+def check_permissions(need_accessibility: bool = True) -> bool:
+    """Ask for Camera (and optionally Accessibility); False if something is missing."""
+    return permissions.check_permissions(message_box, need_accessibility)
 
 
-def parse_hotkey(spec: str):
-    return spec
-
-
-__all__ = ["NAME", "SUPPORTED", "acquire_single_instance", "autostart_enabled", "focus_screen",
-           "get_cursor", "GlobalHotkey", "last_input_tick", "list_screens", "make_dpi_aware",
-           "message_box", "mouse_button_down", "open_file", "parse_hotkey", "set_autostart",
-           "set_cursor"]
+__all__ = ["NAME", "SUPPORTED", "acquire_single_instance", "autostart_enabled", "check_permissions",
+           "focus_screen", "get_cursor", "GlobalHotkey", "last_input_tick", "list_screens",
+           "make_dpi_aware", "message_box", "mouse_button_down", "open_file", "parse_hotkey",
+           "set_autostart", "set_cursor"]

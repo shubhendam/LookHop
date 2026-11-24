@@ -7,6 +7,7 @@ Keys: SPACE / click = start, ESC / right-click = cancel,
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 import tkinter as tk
@@ -15,7 +16,7 @@ import numpy as np
 
 from lookhop.config import APP_NAME, Config
 from lookhop.model import LAPTOP, MONITOR, GazeModel, cross_validate, make_meta
-from lookhop.platform import list_screens, message_box, resolve_roles
+from lookhop.platform import list_screens, message_box, resolve_roles, ui_font
 from lookhop.tracker import Camera, FaceFeatures
 
 log = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ DIM = "#6b6f7a"
 ACCENT = "#4da3ff"
 WARN = "#ffb547"
 OK = "#4cd17a"
-FONT = "Segoe UI"
+FONT = ui_font(0)[0]
 
 
 def build_sequence(rounds: int) -> list[tuple[str, tuple[float, float]]]:
@@ -51,6 +52,7 @@ class _Sampler(threading.Thread):
     """Reads the camera as fast as it can; while recording, stores labelled features."""
 
     def __init__(self, cfg: Config):
+        """Start with no samples; the thread is started by the calibrator."""
         super().__init__(daemon=True, name="calib-sampler")
         self.cfg = cfg
         self.error: str | None = None
@@ -62,17 +64,21 @@ class _Sampler(threading.Thread):
         self.samples: list[tuple[np.ndarray, int, int]] = []
 
     def record(self, label: int | None, group: int = -1) -> None:
+        """Label incoming frames as `label` (laptop/monitor) for dot `group`; None stops recording."""
         with self._lock:
             self._label = None if label is None else (label, group)
 
     def clear(self) -> None:
+        """Drop all samples collected so far."""
         with self._lock:
             self.samples = []
 
     def stop(self) -> None:
+        """Ask the camera thread to finish."""
         self._halt.set()
 
     def run(self) -> None:
+        """Camera loop: read frames, extract face features, store labelled samples."""
         cam = Camera(self.cfg.camera_index, self.cfg.camera_width, self.cfg.camera_height)
         try:
             features = FaceFeatures()
@@ -113,7 +119,9 @@ class _Sampler(threading.Thread):
 
 
 class _Calibrator:
+    """Full-screen calibration: shows dots on both displays and trains the gaze model."""
     def __init__(self, cfg: Config):
+        """Create one borderless window per display and start the camera sampler."""
         self.cfg = cfg
         laptop, monitor = resolve_roles(list_screens(), cfg.laptop_display)
         if monitor is None:
@@ -132,14 +140,23 @@ class _Calibrator:
         self.windows: dict[str, tk.Toplevel] = {}
         for role, s in self.screens.items():
             win = tk.Toplevel(self.root)
-            win.overrideredirect(True)
+            if sys.platform == "darwin":
+                # overrideredirect windows can't take keyboard focus on macOS; a borderless
+                # "plain" window can.
+                try:
+                    win.tk.call("::tk::unsupported::MacWindowStyle", "style", win._w, "plain", "none")
+                except tk.TclError:
+                    win.overrideredirect(True)
+            else:
+                win.overrideredirect(True)
             win.geometry(f"{s.width}x{s.height}+{s.left}+{s.top}")
             win.configure(bg=BG)
             win.attributes("-topmost", True)
-            try:
-                win.configure(cursor="none")
-            except tk.TclError:
-                pass
+            if sys.platform != "darwin":  # on macOS the cursor stays visible until the dots start
+                try:
+                    win.configure(cursor="none")
+                except tk.TclError:
+                    pass
             c = tk.Canvas(win, bg=BG, highlightthickness=0, width=s.width, height=s.height)
             c.pack(fill="both", expand=True)
             win.bind("<Key>", self._on_key)
@@ -153,20 +170,30 @@ class _Calibrator:
 
     # ---------- drawing ----------
     def _size(self, role):
+        """Pixel size of the display used for `role` (laptop/monitor)."""
         s = self.screens[role]
         return s.width, s.height
 
     def _clear(self):
+        """Erase everything drawn on both displays."""
         for c in self.canvas.values():
             c.delete("all")
 
     def _text(self, role, y_frac, text, size=20, color=FG, tag=None):
+        """Draw centered text on `role`'s display at a vertical fraction of its height."""
         w, h = self._size(role)
         self.canvas[role].create_text(w / 2, h * y_frac, text=text, fill=color, tags=tag,
                                       font=(FONT, size), justify="center", width=w * 0.8)
 
     # ---------- phases ----------
     def run(self) -> bool:
+        """Show the intro screen and run Tk until calibration ends; True if a profile was saved."""
+        if sys.platform == "darwin":  # menu-bar apps aren't frontmost by default
+            try:
+                from AppKit import NSApplication
+                NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            except Exception:  # noqa: BLE001
+                pass
         self.windows["laptop"].after(100, lambda: self.windows["laptop"].focus_force())
         self._show_intro()
         self.root.mainloop()
@@ -175,6 +202,7 @@ class _Calibrator:
         return self.saved
 
     def _show_intro(self):
+        """Intro screen: instructions, glasses state and camera/face status."""
         self.phase = "intro"
         self._clear()
         glasses = "ON" if self.cfg.glasses else "OFF"
@@ -183,13 +211,14 @@ class _Calibrator:
                 "Look at each dot the way you naturally would - turn your head as usual,\n"
                 "don't hold it artificially still.\n\n"
                 f"Glasses mode: {glasses}   ·   about {len(self.sequence) * (SETTLE_MS + RECORD_MS) // 1000} seconds\n\n"
-                "Press SPACE (or click) to start  ·  ESC to cancel")
+                "Press SPACE (or click) to start  ·  G to toggle glasses mode  ·  ESC to cancel")
         self._text("laptop", 0.30, f"{APP_NAME} calibration", size=32)
         self._text("laptop", 0.55, body, size=16)
         self._text("monitor", 0.5, "Calibration starting on the laptop screen…", size=22, color=DIM)
         self._update_face_status()
 
     def _update_face_status(self):
+        """Refresh the 'face detected' line on the intro screen (polls every 200 ms)."""
         if self.phase != "intro":
             return
         c = self.canvas["laptop"]
@@ -207,14 +236,19 @@ class _Calibrator:
         self.root.after(200, self._update_face_status)
 
     def _start(self):
+        """Begin the dot sequence once the camera is ready."""
         if not self.sampler.ready.is_set() or self.sampler.error:
             return
         self.phase = "running"
+        if sys.platform == "darwin":
+            for win in self.windows.values():
+                win.configure(cursor="none")
         self.sampler.clear()
         self.idx = 0
         self._next_point()
 
     def _next_point(self):
+        """Show the next dot, wait for the gaze to settle, then record it."""
         if self.phase != "running":
             return
         if self.idx >= len(self.sequence):
@@ -259,6 +293,7 @@ class _Calibrator:
         settle()
 
     def _finish(self):
+        """Train the model from the recorded samples and show the accuracy result."""
         self.phase = "result"
         self.sampler.record(None)
         samples = list(self.sampler.samples)
@@ -299,6 +334,7 @@ class _Calibrator:
         self._text("monitor", 0.5, "Results are on the laptop screen", size=22, color=DIM)
 
     def _save(self):
+        """Write the trained model to the profile file and close."""
         if self._pending_model is None:
             return
         self._pending_model.save(self.cfg.profile_path)
@@ -307,6 +343,7 @@ class _Calibrator:
         self.root.quit()
 
     def _show_error(self, msg: str):
+        """Show a problem message (e.g. no camera); any key closes."""
         self.phase = "error"
         self._clear()
         self._text("laptop", 0.4, "Calibration can't run", size=28, color=WARN)
@@ -314,6 +351,7 @@ class _Calibrator:
 
     # ---------- input ----------
     def _on_key(self, event):
+        """Keyboard shortcuts: Esc cancel, Space start, Enter save, R redo, G glasses mode."""
         key = event.keysym.lower()
         if key == "escape":
             self._on_action("cancel")
@@ -323,10 +361,15 @@ class _Calibrator:
             self._on_action("save")
         elif key == "r":
             self._on_action("redo")
+        elif key == "g" and self.phase == "intro":  # glasses mode decides which profile is saved
+            self.cfg.glasses = not self.cfg.glasses
+            self.cfg.save()
+            self._show_intro()
         elif self.phase == "error":
             self._on_action("cancel")
 
     def _on_action(self, action: str):
+        """Apply a start / save / redo / cancel request if it is valid in the current phase."""
         if action == "cancel" or self.phase == "error":
             self.phase = "cancelled"
             self.root.quit()

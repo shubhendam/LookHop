@@ -1,7 +1,7 @@
 """Everything OS-specific lives here, one folder per OS:
 
     platform/windows/   complete
-    platform/macos/     not implemented yet - help wanted
+    platform/macos/     complete
     platform/linux/     not implemented yet - help wanted
 
 Each backend exposes the same names (see __all__ below). The rest of LookHop
@@ -22,12 +22,14 @@ Backend contract
   acquire_single_instance(name)   handle to keep, or None when already running
   message_box(text, title, error=False)
   open_file(path)
+  check_permissions(need_accessibility=True) -> bool
+                                  optional: ask for OS privacy permissions (macOS); default True
 """
 from __future__ import annotations
 
 import sys
 
-from lookhop.platform.base import Screen, resolve_roles, screen_at
+from lookhop.platform.base import Screen, resolve_roles, screen_at, ui_font
 
 if sys.platform == "win32":
     from lookhop.platform.windows import *  # noqa: F401,F403
@@ -39,4 +41,10 @@ else:
     from lookhop.platform.linux import *  # noqa: F401,F403
     from lookhop.platform.linux import __all__ as _backend_all
 
-__all__ = ["Screen", "resolve_roles", "screen_at", *_backend_all]
+if "check_permissions" not in globals():  # only macOS needs one
+    def check_permissions(need_accessibility: bool = True) -> bool:
+        """Default: nothing to ask for (only macOS has privacy permissions)."""
+        return True
+
+__all__ = ["Screen", "resolve_roles", "screen_at", "ui_font", "check_permissions",
+           *(n for n in _backend_all if n != "check_permissions")]

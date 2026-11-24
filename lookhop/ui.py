@@ -1,12 +1,15 @@
 """Control panel: live view of what the tracker sees + every setting, applied live.
 
-Tk runs on its own thread (the tray owns the main thread). All Tk calls stay on
-that thread; other threads talk to it through a queue.
+Tk runs on its own thread (on Windows the tray owns the main thread). On macOS
+Cocoa needs the main thread for both the tray icon and Tk, so there Tk takes the
+main thread (run_mainloop) and the tray rides on its event loop. Either way all
+Tk calls stay on the Tk thread; other threads talk to it through a queue.
 """
 from __future__ import annotations
 
 import logging
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -17,7 +20,7 @@ from PIL import Image, ImageTk
 from lookhop.config import APP_NAME, TUNING_KEYS, Config
 from lookhop.engine import LAPTOP, MONITOR, Engine
 from lookhop.platform import (autostart_enabled, get_cursor, list_screens, resolve_roles,
-                              set_autostart)
+                              set_autostart, ui_font)
 
 log = logging.getLogger(__name__)
 
@@ -27,38 +30,63 @@ MAP_BG = "#16181c"
 SCREEN_OFF = "#2a2d33"
 MUTED = "#6b6f7a"
 WARN = "#c77d00"
-FONT = ("Segoe UI", 9)
-FONT_B = ("Segoe UI Semibold", 9)
+FONT = ui_font(9)
+FONT_B = ui_font(9, True)
 
 
 class ControlPanel:
+    """Control panel window: live view and every setting, applied immediately."""
     def __init__(self, cfg: Config, engine: Engine, controller):
+        """Remember the config, engine and controller; the window is built later."""
         self.cfg = cfg
         self.engine = engine
         self.ctl = controller  # TrayApp: toggle_pause, recalibrate, set_glasses, set_hotkey, ...
         self._q: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
         self._visible = False
+        self.on_main_thread = sys.platform == "darwin"
 
     # ---------- thread-safe API ----------
+    def call_soon(self, fn) -> None:
+        """Run fn() on the Tk thread (safe from any thread)."""
+        self._q.put(fn)
+
     def show(self) -> None:
-        if self._thread is None or not self._thread.is_alive():
+        """Show the panel (creating the Tk thread on first use outside macOS)."""
+        if self.on_main_thread:
+            self._q.put("show")
+        elif self._thread is None or not self._thread.is_alive():
             self._thread = threading.Thread(target=self._run, name="ui", daemon=True)
             self._thread.start()
         else:
             self._q.put("show")
 
     def shutdown(self) -> None:
+        """Close the panel and stop its loop."""
         self._q.put("quit")
         if self._thread is not None:
             self._thread.join(timeout=2)
 
     # ---------- Tk thread ----------
-    def _run(self) -> None:
+    def prepare_main_thread(self) -> None:
+        """macOS: create the (hidden) Tk root on the main thread. Must happen before
+        anything else touches NSApplication - Tk installs its own NSApplication
+        subclass and crashes if a plain one already exists."""
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self._build()
+
+    def run_mainloop(self) -> None:
+        """Run Tk on the calling (main) thread until shutdown(); starts hidden."""
+        self._run(prebuilt=True)
+
+    def _run(self, prebuilt: bool = False) -> None:
+        """Build the window and run Tk's main loop."""
         try:
-            self.root = tk.Tk()
-            self._build()
-            self._show()
+            if not prebuilt:
+                self.root = tk.Tk()
+                self._build()
+                self._show()
             self.root.after(TICK_MS, self._tick)
             self.root.mainloop()
         except Exception:
@@ -71,23 +99,37 @@ class ControlPanel:
                 pass
 
     def _show(self) -> None:
+        """Bring the window to the front and start the live preview."""
         self._visible = True
         self.root.deiconify()
         self.root.lift()
+        if sys.platform == "darwin":  # menu-bar apps aren't frontmost by default
+            try:
+                from AppKit import NSApplication
+                NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            except Exception:  # noqa: BLE001
+                pass
         self.root.focus_force()
         self.engine.ui_preview = self.show_cam.get()
 
     def _hide(self) -> None:
+        """Hide the window, stop the preview and save pending changes."""
         self._visible = False
         self.engine.ui_preview = False
         self._flush_save()
         self.root.withdraw()
 
     def _tick(self) -> None:
+        """Timer: handle queued messages and refresh the live view."""
         try:
             while True:
                 msg = self._q.get_nowait()
-                if msg == "show":
+                if callable(msg):
+                    try:
+                        msg()
+                    except Exception:
+                        log.exception("call_soon callback failed")
+                elif msg == "show":
                     self._show()
                 elif msg == "quit":
                     self._flush_save()
@@ -104,6 +146,7 @@ class ControlPanel:
 
     # ---------- layout ----------
     def _build(self) -> None:
+        """Create the window, styles and tabs."""
         root = self.root
         root.title(APP_NAME)
         root.protocol("WM_DELETE_WINDOW", self._hide)
@@ -119,7 +162,7 @@ class ControlPanel:
         except tk.TclError:
             pass
         style.configure("Muted.TLabel", foreground=MUTED)
-        style.configure("Head.TLabel", font=("Segoe UI Semibold", 12))
+        style.configure("Head.TLabel", font=ui_font(12, True))
         style.configure("Section.TLabel", font=FONT_B)
 
         self._vars: dict[str, tuple[tk.Variable, callable]] = {}
@@ -169,12 +212,14 @@ class ControlPanel:
         self._screens_at = time.monotonic()
 
     def _tab(self, title: str) -> ttk.Frame:
+        """Add a notebook tab and return its frame."""
         f = ttk.Frame(self.nb, padding=10)
         f.columnconfigure(1, weight=1)
         self.nb.add(f, text=title)
         return f
 
     def _build_behaviour(self, f: ttk.Frame) -> None:
+        """Behaviour tab: mode, jump target, typing guard, glasses, recalibrate."""
         r = 0
         ttk.Label(f, text="Jump the cursor", style="Section.TLabel").grid(row=r, column=0, columnspan=3, sticky="w")
         r += 1
@@ -230,6 +275,7 @@ class ControlPanel:
         self.calib_lbl.pack(side="left", padx=10)
 
     def _build_tuning(self, f: ttk.Frame) -> None:
+        """Tuning tab: sliders for hold times and thresholds."""
         ttk.Label(f, text="Lower hold times feel snappier; higher ones mean fewer accidental jumps.",
                   style="Muted.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
         ms = lambda v: f"{v:.0f} ms"
@@ -251,9 +297,11 @@ class ControlPanel:
             self._slider(f, i, *row)
 
     def _build_system(self, f: ttk.Frame) -> None:
+        """System tab: displays, camera, hotkey, autostart, notifications, files."""
         r = 0
         ttk.Label(f, text="Laptop display").grid(row=r, column=0, sticky="w", pady=3)
-        names = ["left", "right", "primary"] + [s.name for s in list_screens()]
+        names = (["left", "right", "primary"] + (["builtin"] if sys.platform == "darwin" else [])
+                 + [s.name for s in list_screens()])
         self.display_var = tk.StringVar(value=self.cfg.laptop_display)
         cb = ttk.Combobox(f, values=names, textvariable=self.display_var, state="readonly", width=18)
         cb.grid(row=r, column=1, sticky="w", pady=3)
@@ -275,14 +323,15 @@ class ControlPanel:
         entry.pack(side="left")
         entry.bind("<Return>", lambda _e: self._apply_hotkey())
         ttk.Button(hk, text="Apply", command=self._apply_hotkey).pack(side="left", padx=6)
-        self.hotkey_msg = ttk.Label(hk, text="e.g. ctrl+alt+g, win+shift+f9", style="Muted.TLabel")
+        self.hotkey_msg = ttk.Label(hk, text=("e.g. ctrl+alt+g (alt = Option), cmd+shift+f9" if sys.platform == "darwin"
+                                 else "e.g. ctrl+alt+g, win+shift+f9"), style="Muted.TLabel")
         self.hotkey_msg.pack(side="left")
         r += 1
 
         self._check(f, r, "show_notifications", "Show notifications")
         r += 1
         self.autostart_var = tk.BooleanVar(value=autostart_enabled())
-        ttk.Checkbutton(f, text="Start with Windows", variable=self.autostart_var,
+        ttk.Checkbutton(f, text="Start at login" if sys.platform == "darwin" else "Start with Windows", variable=self.autostart_var,
                         command=self._toggle_autostart).grid(row=r, column=0, columnspan=3, sticky="w", pady=3)
         r += 1
         row = ttk.Frame(f)
@@ -292,6 +341,7 @@ class ControlPanel:
 
     # ---------- widgets bound to config ----------
     def _slider(self, f, row, key, label, lo, hi, step, fmt):
+        """Add a labelled slider for a numeric setting."""
         is_int = isinstance(getattr(Config(), key), int)
         var = tk.DoubleVar(value=getattr(self.cfg, key))
         ttk.Label(f, text=label).grid(row=row, column=0, sticky="w", pady=2)
@@ -314,12 +364,14 @@ class ControlPanel:
         self._vars[key] = (var, lambda: (var.set(getattr(self.cfg, key)), show(getattr(self.cfg, key))))
 
     def _check(self, f, row, key, text):
+        """Add a checkbox bound to a boolean setting."""
         var = tk.BooleanVar(value=getattr(self.cfg, key))
         ttk.Checkbutton(f, text=text, variable=var, command=lambda: self._set(key, bool(var.get()))
                         ).grid(row=row, column=0, columnspan=3, sticky="w", padx=(10, 0), pady=(4, 0))
         self._vars[key] = (var, lambda: var.set(getattr(self.cfg, key)))
 
     def _set(self, key: str, value) -> None:
+        """Apply a changed setting to the config and engine, and schedule a save."""
         setattr(self.cfg, key, value)
         # keep the two thresholds consistent (exit must not exceed enter)
         if key == "laptop_enter_prob" and self.cfg.laptop_exit_prob > value:
@@ -338,6 +390,7 @@ class ControlPanel:
         self._save_job = self.root.after(500, self._flush_save)
 
     def _flush_save(self) -> None:
+        """Write the settings to disk now."""
         if self._save_job is not None:
             try:
                 self.root.after_cancel(self._save_job)
@@ -350,6 +403,7 @@ class ControlPanel:
             log.exception("Could not save settings")
 
     def _reset_tuning(self) -> None:
+        """Restore the tuning sliders to their defaults."""
         defaults = Config()
         for key in TUNING_KEYS:
             setattr(self.cfg, key, getattr(defaults, key))
@@ -360,9 +414,11 @@ class ControlPanel:
 
     # ---------- actions ----------
     def _toggle_pause(self) -> None:
+        """Pause/resume from the panel."""
         self.ctl.toggle_pause()
 
     def _cam_toggled(self) -> None:
+        """Turn the live camera preview on or off."""
         on = self.show_cam.get()
         self.engine.ui_preview = on and self._visible
         if on:
@@ -373,6 +429,7 @@ class ControlPanel:
             self._cam_photo = None
 
     def _apply_hotkey(self) -> None:
+        """Apply the hotkey typed into the box and show the result."""
         ok, msg = self.ctl.set_hotkey(self.hotkey_var.get().strip())
         self.hotkey_msg.config(text="Saved ✓" if ok else msg,
                                foreground="" if ok else WARN)
@@ -380,6 +437,7 @@ class ControlPanel:
             self.hotkey_var.set(self.cfg.hotkey)
 
     def _toggle_autostart(self) -> None:
+        """Turn start-at-login on or off."""
         try:
             set_autostart(self.autostart_var.get())
         except OSError:
@@ -388,6 +446,7 @@ class ControlPanel:
 
     # ---------- live view ----------
     def _update_live(self) -> None:
+        """Refresh status, preview, map and bar from the engine."""
         e = self.engine
         now = time.monotonic()
         if now - self._screens_at > 2.0:
@@ -425,6 +484,7 @@ class ControlPanel:
                 self.cam_lbl.configure(image=self._cam_photo)
 
     def _draw_map(self, running: bool) -> None:
+        """Draw the display layout with the current gaze target highlighted."""
         c = self.map
         c.delete("all")
         W, H = int(c["width"]), int(c["height"])
@@ -453,13 +513,14 @@ class ControlPanel:
                                width=3 if flash and flash[1] == role else 2)
             label = {LAPTOP: "Laptop", MONITOR: "Monitor"}.get(role, s.name)
             c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label,
-                          fill="#0b0c0e" if lit else "#9aa0aa", font=("Segoe UI Semibold", 11))
+                          fill="#0b0c0e" if lit else "#9aa0aa", font=ui_font(11, True))
         pos = get_cursor()
         if pos:
             x, y = to_canvas(*pos)
             c.create_oval(x - 4, y - 4, x + 4, y + 4, fill="#ff5a5a", outline="white")
 
     def _draw_bar(self, running: bool) -> None:
+        """Draw the laptop-vs-monitor probability bar."""
         c = self.bar
         c.delete("all")
         W, H = int(c["width"]), int(c["height"])
@@ -476,5 +537,5 @@ class ControlPanel:
                           (self.cfg.laptop_exit_prob, COLORS[MONITOR])):
             x = x1 - (x1 - x0) * prob
             c.create_line(x, y0 - 3, x, y1 + 3, fill=col, width=2)
-        c.create_text(x0, y1 + 5, text="laptop", anchor="nw", fill=MUTED, font=("Segoe UI", 7))
-        c.create_text(x1, y1 + 5, text="monitor", anchor="ne", fill=MUTED, font=("Segoe UI", 7))
+        c.create_text(x0, y1 + 5, text="laptop", anchor="nw", fill=MUTED, font=ui_font(7))
+        c.create_text(x1, y1 + 5, text="monitor", anchor="ne", fill=MUTED, font=ui_font(7))
